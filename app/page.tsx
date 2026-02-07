@@ -2,111 +2,117 @@
 
 import { useState } from "react";
 
-export default function Home() {
-  const [text, setText] = useState("");
-  const [output, setOutput] = useState("");
+export default function HomePage() {
+  const [inputText, setInputText] = useState("");
+  const [output, setOutput] = useState("(No output yet)");
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
 
-  async function onSubmit(e: React.FormEvent) {
-    e.preventDefault();
+  async function handleSubmit() {
+    if (!inputText.trim()) {
+      setOutput("Please enter some text.");
+      return;
+    }
+
     setLoading(true);
-    setError(null);
-    setOutput("");
+    setOutput("Calling DeepSeek…");
 
+    let res: Response;
     try {
-      const res = await fetch("/api/deepseek", {
+      res = await fetch("/api/deepseek", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text }),
+        body: JSON.stringify({ text: inputText }),
       });
-
-      const data = await res.json().catch(() => ({}));
-
-      if (!res.ok) {
-        throw new Error(data?.error || `Request failed (${res.status})`);
-      }
-
-      setOutput(data?.output ?? "");
     } catch (err: any) {
-      setError(err?.message || "Unknown error");
-    } finally {
+      setOutput(`Network error:\n${String(err?.message ?? err)}`);
       setLoading(false);
+      return;
     }
+
+    let bodyText = "";
+    try {
+      bodyText = await res.text();
+    } catch {
+      setOutput(`Failed to read response (status ${res.status})`);
+      setLoading(false);
+      return;
+    }
+
+    if (!res.ok) {
+      setOutput(`ERROR ${res.status}\n\n${bodyText}`);
+      setLoading(false);
+      return;
+    }
+
+    // Try to unwrap JSON; otherwise show raw text
+    try {
+      const parsed = JSON.parse(bodyText);
+      if (typeof parsed?.output === "string") {
+        setOutput(parsed.output);
+      } else {
+        setOutput(JSON.stringify(parsed, null, 2));
+      }
+    } catch {
+      setOutput(bodyText || "(Empty response)");
+    }
+
+    setLoading(false);
   }
 
   return (
-    <main style={{ maxWidth: 900, margin: "48px auto", padding: "0 16px" }}>
-      <h1 style={{ fontSize: 28, fontWeight: 700, marginBottom: 12 }}>
-        Initial Model Draft
-      </h1>
-
-      <p style={{ marginBottom: 16, opacity: 0.8 }}>
-        Insert demo text below, and see it transformed into our strict JSON format. Outputs are connected to a database to which they are committed.
+    <main style={{ maxWidth: 900, margin: "40px auto", padding: "0 20px" }}>
+      <h1 style={{ fontSize: 28, marginBottom: 8 }}>Initial Model Draft</h1>
+      <p style={{ marginBottom: 20, color: "#555" }}>
+        Insert demo text below, and see it transformed into our strict JSON
+        format. Outputs are connected to a database to which they are committed.
       </p>
 
-      <form onSubmit={onSubmit} style={{ display: "grid", gap: 12 }}>
-        <textarea
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-          placeholder="Enter sample text…"
-          rows={8}
-          style={{
-            width: "100%",
-            padding: 12,
-            fontSize: 14,
-            borderRadius: 10,
-            border: "1px solid #ddd",
-            resize: "vertical",
-          }}
-        />
+      <textarea
+        value={inputText}
+        onChange={(e) => setInputText(e.target.value)}
+        rows={6}
+        placeholder="Enter text here…"
+        style={{
+          width: "100%",
+          padding: 12,
+          fontSize: 16,
+          borderRadius: 8,
+          border: "1px solid #ccc",
+          marginBottom: 16,
+        }}
+      />
 
-        <button
-          type="submit"
-          disabled={loading || text.trim().length === 0}
-          style={{
-            padding: "10px 14px",
-            borderRadius: 10,
-            border: "1px solid #ddd",
-            cursor: loading ? "not-allowed" : "pointer",
-            fontWeight: 600,
-          }}
-        >
-          {loading ? "Calling DeepSeek…" : "Submit"}
-        </button>
-      </form>
+      <button
+        onClick={handleSubmit}
+        disabled={loading}
+        style={{
+          width: "100%",
+          padding: "12px 0",
+          fontSize: 16,
+          borderRadius: 8,
+          border: "1px solid #ccc",
+          backgroundColor: loading ? "#eee" : "#fff",
+          cursor: loading ? "not-allowed" : "pointer",
+          marginBottom: 24,
+        }}
+      >
+        {loading ? "Calling DeepSeek…" : "Submit"}
+      </button>
 
-      {error && (
-        <div
-          style={{
-            marginTop: 16,
-            padding: 12,
-            borderRadius: 10,
-            border: "1px solid #f2c2c2",
-            background: "#fff5f5",
-          }}
-        >
-          <strong>Error:</strong> {error}
-        </div>
-      )}
-
-      <div style={{ marginTop: 16 }}>
-        <h2 style={{ fontSize: 16, fontWeight: 700, marginBottom: 8 }}>
-          Output
-        </h2>
-        <pre
-          style={{
-            whiteSpace: "pre-wrap",
-            padding: 12,
-            borderRadius: 10,
-            border: "1px solid #ddd",
-            background: "#fafafa",
-            minHeight: 80,
-          }}
-        >
-          {output || "(No output yet)"}
-        </pre>
-      </div>
+      <h2 style={{ fontSize: 20, marginBottom: 8 }}>Output</h2>
+      <pre
+        style={{
+          minHeight: 120,
+          padding: 16,
+          borderRadius: 8,
+          border: "1px solid #ddd",
+          backgroundColor: "#fafafa",
+          whiteSpace: "pre-wrap",
+          wordBreak: "break-word",
+        }}
+      >
+        {output}
+      </pre>
     </main>
   );
 }
