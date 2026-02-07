@@ -58,16 +58,11 @@ Formatting rules:
 `.trim();
 
 function buildPrompt(userText: string) {
-  // Single-string prompt for HF text-generation style endpoints
   return `${SYSTEM_PROMPT}\n\nUser text: ${JSON.stringify(userText)}`;
 }
 
 function extractGeneratedText(data: any): string {
   // Common HF endpoint shapes:
-  // 1) [{ generated_text: "..." }]
-  // 2) { generated_text: "..." }
-  // 3) { outputs: "..." } or { output: "..." } (some custom handlers)
-  // 4) { choices: [{ text: "..." }] } (some OpenAI-compat layers)
   if (Array.isArray(data) && typeof data?.[0]?.generated_text === "string") {
     return data[0].generated_text;
   }
@@ -76,8 +71,66 @@ function extractGeneratedText(data: any): string {
   if (typeof data?.output === "string") return data.output;
   if (typeof data?.choices?.[0]?.text === "string") return data.choices[0].text;
 
-  // Last-resort: stringify so you can see what the endpoint actually returned
   return "";
+}
+
+function stripEchoedPrompt(full: string, prompt: string): string {
+  let out = full ?? "";
+
+  // Exact prefix match
+  if (out.startsWith(prompt)) {
+    out = out.slice(prompt.length);
+  } else {
+    // Tolerate minor whitespace/newlines differences by stripping common "prompt then newline" patterns
+    const idx = out.indexOf(prompt);
+    if (idx === 0) out = out.slice(prompt.length);
+  }
+
+  // Trim leading whitespace that often appears after stripping
+  out = out.replace(/^\s+/, "");
+  return out;
+}
+
+/**
+ * Robustly extract the first top-level JSON object from a string.
+ * This avoids brittle regex. It scans for balanced braces outside strings.
+ */
+function extractFirstJsonObject(s: string): string | null {
+  const text = s ?? "";
+  const start = text.indexOf("{");
+  if (start === -1) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+
+    if (inString) {
+      if (escape) {
+        escape = false;
+      } else if (ch === "\\") {
+        escape = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    } else {
+      if (ch === '"') {
+        inString = true;
+        continue;
+      }
+      if (ch === "{") depth++;
+      if (ch === "}") depth--;
+
+      if (depth === 0) {
+        return text.slice(start, i + 1);
+      }
+    }
+  }
+
+  return null;
 }
 
 export async function POST(req: Request) {
@@ -106,9 +159,18 @@ export async function POST(req: Request) {
     body: JSON.stringify({
       inputs: prompt,
       parameters: {
-        temperature: 0.0, // strict JSON friendliness
+        // Make generation deterministic + reduce prompt echo likelihood
+        do_sample: false,
+        temperature: 0.0,
+        top_p: 1.0,
+
         max_new_tokens: 800,
-        return_full_text: false, // try to return only completion (supported by many HF text-gen stacks)
+
+        // Many TGI/HF text-gen stacks honor this; some ignore it.
+        return_full_text: false,
+
+        // Some stacks honor "repetition_penalty" and "stop"; harmless if ignored.
+        repetition_penalty: 1.05,
       },
     }),
   });
@@ -121,18 +183,26 @@ export async function POST(req: Request) {
   }
 
   const data = await response.json();
-  const output = extractGeneratedText(data) || "";
 
-  // Parse JSON so to allow storage as jsonb; store null if invalid JSON.
+  // 1) Pull raw generation field (may include prompt echo depending on server)
+  const raw = extractGeneratedText(data) || "";
+
+  // 2) Strip echoed prompt if present
+  let cleaned = stripEchoedPrompt(raw, prompt);
+
+  // 3) If the model/server still returned extra text, extract the first JSON object
+  //    (this often fixes cases where the model prefaces JSON with explanations)
+  const jsonSlice = extractFirstJsonObject(cleaned);
+  if (jsonSlice) cleaned = jsonSlice;
+
+  // 4) Parse for jsonb storage; store null if invalid
   let outputJson: any = null;
   try {
-    outputJson = JSON.parse(output);
+    outputJson = JSON.parse(cleaned);
   } catch {
     // leave null
   }
 
-  // Store in Neon/Postgres: value_extractions(id, created_at, input_text, output_json, model)
-  // NOTE: set model string to something that identifies the HF endpoint/model.
   const modelLabel = "hf-inference-endpoint";
 
   try {
@@ -141,10 +211,10 @@ export async function POST(req: Request) {
       values (${text}, ${outputJson}, ${modelLabel})
     `;
   } catch (err: any) {
-    // If DB insert fails, return model output so UI doesn’t break.
+    // If DB insert fails, still return output so UI doesn't break.
     return NextResponse.json(
       {
-        output,
+        output: cleaned,
         db_error: "Failed to insert into database",
         details: String(err?.message ?? err),
       },
@@ -152,5 +222,5 @@ export async function POST(req: Request) {
     );
   }
 
-  return NextResponse.json({ output });
+  return NextResponse.json({ output: cleaned });
 }
