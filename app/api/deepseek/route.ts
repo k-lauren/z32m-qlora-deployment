@@ -3,6 +3,8 @@ import { NextResponse } from "next/server";
 import { sql } from "@vercel/postgres";
 
 export const runtime = "nodejs";
+// Give the function enough time on Vercel (effective limit depends on your plan)
+export const maxDuration = 60;
 
 const HF_ENDPOINT =
   "https://aq0id722fm7bd5xm.us-east-1.aws.endpoints.huggingface.cloud";
@@ -63,6 +65,10 @@ function buildPrompt(userText: string) {
 
 function extractGeneratedText(data: any): string {
   // Common HF endpoint shapes:
+  // 1) [{ generated_text: "..." }]
+  // 2) { generated_text: "..." }
+  // 3) { outputs: "..." } or { output: "..." }
+  // 4) { choices: [{ text: "..." }] } (OpenAI-compat layers)
   if (Array.isArray(data) && typeof data?.[0]?.generated_text === "string") {
     return data[0].generated_text;
   }
@@ -70,30 +76,17 @@ function extractGeneratedText(data: any): string {
   if (typeof data?.outputs === "string") return data.outputs;
   if (typeof data?.output === "string") return data.output;
   if (typeof data?.choices?.[0]?.text === "string") return data.choices[0].text;
-
   return "";
 }
 
 function stripEchoedPrompt(full: string, prompt: string): string {
   let out = full ?? "";
-
-  // Exact prefix match
-  if (out.startsWith(prompt)) {
-    out = out.slice(prompt.length);
-  } else {
-    // Tolerate minor whitespace/newlines differences by stripping common "prompt then newline" patterns
-    const idx = out.indexOf(prompt);
-    if (idx === 0) out = out.slice(prompt.length);
-  }
-
-  // Trim leading whitespace that often appears after stripping
-  out = out.replace(/^\s+/, "");
-  return out;
+  if (out.startsWith(prompt)) out = out.slice(prompt.length);
+  return out.replace(/^\s+/, "");
 }
 
 /**
- * Robustly extract the first top-level JSON object from a string.
- * This avoids brittle regex. It scans for balanced braces outside strings.
+ * Extract the first top-level JSON object from a string via balanced braces outside strings.
  */
 function extractFirstJsonObject(s: string): string | null {
   const text = s ?? "";
@@ -108,13 +101,9 @@ function extractFirstJsonObject(s: string): string | null {
     const ch = text[i];
 
     if (inString) {
-      if (escape) {
-        escape = false;
-      } else if (ch === "\\") {
-        escape = true;
-      } else if (ch === '"') {
-        inString = false;
-      }
+      if (escape) escape = false;
+      else if (ch === "\\") escape = true;
+      else if (ch === '"') inString = false;
       continue;
     } else {
       if (ch === '"') {
@@ -124,9 +113,7 @@ function extractFirstJsonObject(s: string): string | null {
       if (ch === "{") depth++;
       if (ch === "}") depth--;
 
-      if (depth === 0) {
-        return text.slice(start, i + 1);
-      }
+      if (depth === 0) return text.slice(start, i + 1);
     }
   }
 
@@ -150,77 +137,101 @@ export async function POST(req: Request) {
 
   const prompt = buildPrompt(text);
 
-  const response = await fetch(HF_ENDPOINT, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      inputs: prompt,
-      parameters: {
-        // Make generation deterministic + reduce prompt echo likelihood
-        do_sample: false,
-        temperature: 0.0,
-        top_p: 1.0,
+  // Abort HF call before Vercel kills the function (prevents "POST ---" in logs)
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 50_000);
 
-        max_new_tokens: 150,
-
-        // Many TGI/HF text-gen stacks honor this; some ignore it.
-        return_full_text: false,
-
-        // Some stacks honor "repetition_penalty" and "stop"; harmless if ignored.
-        repetition_penalty: 1.05,
+  let hfResp: Response;
+  try {
+    hfResp = await fetch(HF_ENDPOINT, {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
       },
-    }),
-  });
-
-  if (!response.ok) {
+      body: JSON.stringify({
+        inputs: prompt,
+        parameters: {
+          do_sample: false,
+          temperature: 0.0,
+          top_p: 1.0,
+          max_new_tokens: 150,
+          return_full_text: false,
+        },
+      }),
+    });
+  } catch (err: any) {
+    clearTimeout(timeoutId);
+    const isAbort = err?.name === "AbortError";
     return NextResponse.json(
-      { error: "HF endpoint request failed", details: await response.text() },
+      {
+        error: isAbort ? "HF request timed out" : "HF request failed",
+        details: String(err?.message ?? err),
+      },
+      { status: isAbort ? 504 : 502 }
+    );
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  if (!hfResp.ok) {
+    const details = await hfResp.text().catch(() => "");
+    return NextResponse.json(
+      { error: "HF endpoint error", status: hfResp.status, details },
       { status: 502 }
     );
   }
 
-  const data = await response.json();
-
-  // 1) Pull raw generation field (may include prompt echo depending on server)
+  const data = await hfResp.json();
   const raw = extractGeneratedText(data) || "";
 
-  // 2) Strip echoed prompt if present
-  let cleaned = stripEchoedPrompt(raw, prompt);
+  if (!raw) {
+    return NextResponse.json(
+      {
+        error: "No generated text found in HF response",
+        returned_keys: Object.keys(data ?? {}),
+      },
+      { status: 502 }
+    );
+  }
 
-  // 3) If the model/server still returned extra text, extract the first JSON object
-  //    (this often fixes cases where the model prefaces JSON with explanations)
+  // Clean: remove prompt echo, then isolate first JSON object if needed
+  let cleaned = stripEchoedPrompt(raw, prompt);
   const jsonSlice = extractFirstJsonObject(cleaned);
   if (jsonSlice) cleaned = jsonSlice;
 
-  // 4) Parse for jsonb storage; store null if invalid
+  // Parse JSON for jsonb; keep parse_error if invalid
   let outputJson: any = null;
+  let parse_error: string | null = null;
   try {
     outputJson = JSON.parse(cleaned);
-  } catch {
-    // leave null
+  } catch (e: any) {
+    parse_error = String(e?.message ?? e);
   }
 
   const modelLabel = "hf-inference-endpoint";
 
+  // Insert and RETURNING to confirm DB write (or capture db_error)
+  let db: { id: any; created_at: any } | null = null;
+  let db_error: string | null = null;
+
   try {
-    await sql`
+    const result = await sql`
       insert into value_extractions (input_text, output_json, model)
       values (${text}, ${outputJson}, ${modelLabel})
+      returning id, created_at
     `;
+    db = (result?.rows?.[0] as any) ?? null;
   } catch (err: any) {
-    // If DB insert fails, still return output so UI doesn't break.
-    return NextResponse.json(
-      {
-        output: cleaned,
-        db_error: "Failed to insert into database",
-        details: String(err?.message ?? err),
-      },
-      { status: 200 }
-    );
+    db_error = String(err?.message ?? err);
   }
 
-  return NextResponse.json({ output: cleaned });
+  // Always return a diagnostic envelope so the UI can show what's happening
+  return NextResponse.json({
+    output: cleaned,
+    parse_error, // null if JSON parsed ok
+    db,          // {id, created_at} if insert succeeded
+    db_error,    // null if insert succeeded
+  });
 }
