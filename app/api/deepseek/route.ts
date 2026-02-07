@@ -164,7 +164,7 @@ export async function POST(req: Request) {
         temperature: 0.0,
         top_p: 1.0,
 
-        max_new_tokens: 800,
+        max_new_tokens: 150,
 
         // Many TGI/HF text-gen stacks honor this; some ignore it.
         return_full_text: false,
