@@ -4,7 +4,7 @@ import { sql } from "@vercel/postgres";
 
 export const runtime = "nodejs";
 // Give the function enough time on Vercel (effective limit depends on your plan)
-export const maxDuration = 20;
+export const maxDuration = 120;
 
 const HF_ENDPOINT =
   "https://aq0id722fm7bd5xm.us-east-1.aws.endpoints.huggingface.cloud";
@@ -139,7 +139,7 @@ export async function POST(req: Request) {
 
   // Abort HF call before Vercel kills the function (prevents "POST ---" in logs)
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 50_000);
+  const timeoutId = setTimeout(() => controller.abort(), 110_000);
 
   let hfResp: Response;
   try {
@@ -156,7 +156,7 @@ export async function POST(req: Request) {
           do_sample: false,
           temperature: 0.0,
           top_p: 1.0,
-          max_new_tokens: 450,
+          max_new_tokens: 280,
           return_full_text: false,
         },
       }),
