@@ -154,7 +154,7 @@ export async function POST(req: Request) {
         inputs: prompt,
         parameters: {
           do_sample: false,
-          temperature: 0.0,
+          temperature: 0.1,
           top_p: 1.0,
           max_new_tokens: 280,
           return_full_text: false,
