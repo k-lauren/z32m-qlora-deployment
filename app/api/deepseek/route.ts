@@ -156,7 +156,7 @@ export async function POST(req: Request) {
           do_sample: false,
           temperature: 0.0,
           top_p: 1.0,
-          max_new_tokens: 150,
+          max_new_tokens: 650,
           return_full_text: false,
         },
       }),
