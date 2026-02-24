@@ -7,7 +7,7 @@ export const runtime = "nodejs";
 export const maxDuration = 120;
 
 const HF_ENDPOINT =
-  "https://fcnqv2fo42h3klpx.us-east-1.aws.endpoints.huggingface.cloud";
+  "https://sznti2z5gwi4qksf.us-east-1.aws.endpoints.huggingface.cloud";
 
 const SYSTEM_PROMPT = `
 You are an information extraction and counting engine.
