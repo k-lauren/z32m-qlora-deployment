@@ -64,11 +64,12 @@ function buildPrompt(userText: string) {
 }
 
 function extractGeneratedText(data: any): string {
-  // Common HF endpoint shapes:
-  // 1) [{ generated_text: "..." }]
-  // 2) { generated_text: "..." }
-  // 3) { outputs: "..." } or { output: "..." }
-  // 4) { choices: [{ text: "..." }] } (OpenAI-compat layers)
+  // OpenAI-compatible HF endpoints (vLLM / TGI chat mode)
+  if (typeof data?.choices?.[0]?.message?.content === "string") {
+    return data.choices[0].message.content;
+  }
+
+  // Fallbacks for other HF formats
   if (Array.isArray(data) && typeof data?.[0]?.generated_text === "string") {
     return data[0].generated_text;
   }
@@ -76,6 +77,7 @@ function extractGeneratedText(data: any): string {
   if (typeof data?.outputs === "string") return data.outputs;
   if (typeof data?.output === "string") return data.output;
   if (typeof data?.choices?.[0]?.text === "string") return data.choices[0].text;
+
   return "";
 }
 
@@ -135,32 +137,31 @@ export async function POST(req: Request) {
     );
   }
 
-  const prompt = buildPrompt(text);
+// Abort HF call before Vercel kills the function
+const controller = new AbortController();
+const timeoutId = setTimeout(() => controller.abort(), 110_000);
 
-  // Abort HF call before Vercel kills the function (prevents "POST ---" in logs)
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 110_000);
-
-  let hfResp: Response;
-  try {
-    hfResp = await fetch(HF_ENDPOINT, {
-      method: "POST",
-      signal: controller.signal,
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        inputs: prompt,
-        parameters: {
-          do_sample: false,
-          temperature: 0.1,
-          top_p: 1.0,
-          max_new_tokens: 280,
-          return_full_text: false,
-        },
-      }),
-    });
+let hfResp: Response;
+try {
+  hfResp = await fetch(HF_ENDPOINT, {
+    method: "POST",
+    signal: controller.signal,
+    cache: "no-store",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT },
+        { role: "user", content: text },
+      ],
+      temperature: 0.1,
+      top_p: 1.0,
+      max_tokens: 280,
+      stream: false,
+    }),
+  });
   } catch (err: any) {
     clearTimeout(timeoutId);
     const isAbort = err?.name === "AbortError";
@@ -197,7 +198,7 @@ export async function POST(req: Request) {
   }
 
   // Clean: remove prompt echo, then isolate first JSON object if needed
-  let cleaned = stripEchoedPrompt(raw, prompt);
+  let cleaned = raw;
   const jsonSlice = extractFirstJsonObject(cleaned);
   if (jsonSlice) cleaned = jsonSlice;
 
